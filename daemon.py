@@ -114,6 +114,36 @@ async def poll_loop(account, interval_seconds=60):
 
 # ── Sending ───────────────────────────────────────────────────────────────────
 
+def classify_recipient(recipient):
+    """Return ('self', ...), ('number', ...), ('group', ...), or ('username', ...)."""
+    if recipient.startswith("+"):
+        return ("number", recipient)
+    # Signal usernames end with .NN (e.g. alice.01); group IDs are base64 (longer, no dots)
+    # Heuristic: if it contains a dot and is short, treat as username; otherwise group ID
+    if "." in recipient and len(recipient) < 40:
+        return ("username", recipient)
+    return ("group", recipient)
+
+def get_group_name(account, group_id):
+    """Look up a group's human-readable name via signal-cli listGroups."""
+    try:
+        result = subprocess.run(
+            [SIGNAL_CLI, "-a", account, "--output=json", "listGroups"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0:
+            return None
+        for line in result.stdout.strip().splitlines():
+            try:
+                group = json.loads(line)
+                if group.get("id") == group_id:
+                    return group.get("name")
+            except json.JSONDecodeError:
+                continue
+    except Exception:
+        pass
+    return None
+
 def send_to_self(account, message):
     result = subprocess.run(
         [SIGNAL_CLI, "-a", account, "send", "--note-to-self", "-m", message],
@@ -124,11 +154,12 @@ def send_to_self(account, message):
         raise RuntimeError(result.stderr.strip())
     return True
 
-def send_to_number(account, recipient, message):
-    # Group IDs are base64 strings; phone numbers start with +
-    if recipient.startswith("+"):
+def send_message(account, recipient, message):
+    """Send to a phone number, group ID, or Signal username."""
+    kind, _ = classify_recipient(recipient)
+    if kind == "number" or kind == "username":
         cmd = [SIGNAL_CLI, "-a", account, "send", "-m", message, recipient]
-    else:
+    else:  # group
         cmd = [SIGNAL_CLI, "-a", account, "send", "-m", message, "-g", recipient]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -223,11 +254,20 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"error": str(e)}, 500)
             else:
                 # Sending to someone else: require human confirmation
+                kind, _ = classify_recipient(to)
+                display_name = to
+                if kind == "group":
+                    group_name = get_group_name(self.account, to)
+                    if group_name:
+                        display_name = group_name
+
                 token = secrets.token_urlsafe(32)
                 with _pending_lock:
                     _pending[token] = {
                         "account": self.account,
                         "to": to,
+                        "display_name": display_name,
+                        "recipient_kind": kind,
                         "message": message,
                         "created_at": datetime.utcnow().isoformat(),
                     }
@@ -237,6 +277,7 @@ class Handler(BaseHTTPRequestHandler):
                     "pending": True,
                     "confirm_url": confirm_url,
                     "to": to,
+                    "display_name": display_name,
                     "message": message,
                     "note": "Open confirm_url in your browser to approve or deny this message.",
                 })
@@ -300,7 +341,7 @@ class ConfirmHandler(BaseHTTPRequestHandler):
 <h2>&#x1F4F1; Confirm outbound Signal message</h2>
 <table>
   <tr><td class="label">From</td><td>{e(pending['account'])}</td></tr>
-  <tr><td class="label">To</td><td>{e(pending['to'])}</td></tr>
+  <tr><td class="label">To</td><td>{e(pending['display_name'])}</td></tr>
   <tr><td class="label">Message</td><td class="body-text">{e(pending['message'])}</td></tr>
 </table>
 <div class="actions">
@@ -320,9 +361,9 @@ class ConfirmHandler(BaseHTTPRequestHandler):
                 self.send_html(_page("Already handled", "<h2>&#x274C; Already handled</h2><p>This link is invalid or has already been used.</p>"), 404)
                 return
             try:
-                send_to_number(pending["account"], pending["to"], pending["message"])
+                send_message(pending["account"], pending["to"], pending["message"])
                 print(f"[{datetime.now().isoformat()}] Confirmed and sent to {pending['to']}")
-                body_content = f"<h2>&#x2705; Message sent</h2><p>Sent to <strong>{e(pending['to'])}</strong>.</p>"
+                body_content = f"<h2>&#x2705; Message sent</h2><p>Sent to <strong>{e(pending['display_name'])}</strong>.</p>"
                 self.send_html(_page("Sent", body_content))
             except Exception as ex:
                 body_content = f"<h2>&#x274C; Send failed</h2><pre>{e(str(ex))}</pre>"
@@ -338,7 +379,7 @@ class ConfirmHandler(BaseHTTPRequestHandler):
                 self.send_html(_page("Already handled", "<h2>&#x274C; Already handled</h2><p>This link is invalid or has already been used.</p>"), 404)
                 return
             print(f"[{datetime.now().isoformat()}] Denied send to {pending['to']}")
-            body_content = f"<h2>&#x1F6AB; Cancelled</h2><p>The message to <strong>{e(pending['to'])}</strong> was not sent.</p>"
+            body_content = f"<h2>&#x1F6AB; Cancelled</h2><p>The message to <strong>{e(pending['display_name'])}</strong> was not sent.</p>"
             self.send_html(_page("Cancelled", body_content))
 
         else:

@@ -1,6 +1,6 @@
 ---
 name: signal-daemon
-description: "Use this skill whenever you need to read Signal messages or send a Signal message via the signal-daemon HTTP API. Triggers include: reading recent Signal messages, querying messages by sender or group, sending a message to self or others on Signal, or any interaction with the local signal-daemon running on port 6000."
+description: "Use this skill whenever you need to read Signal messages or send a Signal message via the signal-daemon HTTP API. Triggers include: reading recent Signal messages, querying messages by sender or group, sending a message to self, a phone number, a group, or a Signal username, or any interaction with the local signal-daemon running on port 6000."
 ---
 
 # Signal Daemon HTTP API
@@ -9,7 +9,7 @@ description: "Use this skill whenever you need to read Signal messages or send a
 
 A local HTTP daemon runs on `http://localhost:6000` and exposes two endpoints:
 - `GET /messages` — query received Signal messages from the local SQLite store
-- `GET /send` — send a Signal message to self or another number
+- `GET /send` — send a Signal message to self, a phone number, a group, or a username
 
 Timestamps are always in **milliseconds since Unix epoch**.
 
@@ -91,13 +91,22 @@ curl "http://localhost:6000/messages?since=1774390000000&until=1774399000000"
 
 ## Sending Messages
 
-### Send to self (Note to Self — no confirmation required)
+The `?to=` parameter accepts three kinds of recipient:
+
+| Format | Example | Description |
+|--------|---------|-------------|
+| Phone number | `+1234567890` | Must start with `+` and country code |
+| Group ID | `AfL/co87Ts...` | Base64 string from `group_id` in /messages |
+| Signal username | `alice.01` | Contains a dot, e.g. `name.NN` |
+
+### Send to self (no confirmation required)
+When `to` matches your own account number, the message is sent immediately.
+
 ```bash
 curl --get "http://localhost:6000/send" \
   --data-urlencode "to=+1234567890" \
   --data-urlencode "message=Hello from the daemon"
 ```
-When `to` matches your own account number, the message is sent immediately.
 
 ### Response format (sent immediately)
 ```json
@@ -110,11 +119,22 @@ When `to` matches your own account number, the message is sent immediately.
 
 ---
 
-### Send to another person — requires user confirmation
+### Send to another person, group, or username — requires user confirmation
 
 ```bash
+# To a phone number
 curl --get "http://localhost:6000/send" \
   --data-urlencode "to=+1987654321" \
+  --data-urlencode "message=Hello Alice"
+
+# To a group (use group_id from /messages)
+curl --get "http://localhost:6000/send" \
+  --data-urlencode "to=AfL/co87TsyfTv4FqgJfcF6rNWoRkO2CYLybn83tfTU=" \
+  --data-urlencode "message=Hello everyone"
+
+# To a Signal username
+curl --get "http://localhost:6000/send" \
+  --data-urlencode "to=alice.01" \
   --data-urlencode "message=Hello Alice"
 ```
 
@@ -123,20 +143,18 @@ curl --get "http://localhost:6000/send" \
 {
   "pending": true,
   "confirm_url": "http://localhost:7000/confirm?token=...",
-  "to": "+1987654321",
-  "message": "Hello Alice",
+  "to": "AfL/co87TsyfTv4FqgJfcF6rNWoRkO2CYLybn83tfTU=",
+  "display_name": "Family Chat",
+  "message": "Hello everyone",
   "note": "Open confirm_url in your browser to approve or deny this message."
 }
 ```
 
 > **When you receive a `pending: true` response, you must present the `confirm_url` to the user.** The message has NOT been sent yet. The user must open the URL in their browser and click "Send" to approve, or "Don't send" to cancel. Do not silently discard the URL.
 
-### Error response
-```json
-{
-  "error": "some signal-cli error message"
-}
-```
+### Notes
+- `display_name` is the human-readable name shown on the confirmation page. For groups it is the group name looked up from signal-cli; for phone numbers and usernames it is the `to` value as given.
+- Signal usernames (e.g. `alice.01`) are detected by the presence of a dot and a short length. If you pass something that is neither a phone number nor a known group ID and does not match the username heuristic, it will be sent as a username anyway — signal-cli will return an error if it is not valid.
 
 ---
 
@@ -148,7 +166,7 @@ curl --get "http://localhost:6000/send" \
 | `until`   | /messages | int    | End timestamp in milliseconds (inclusive)                  |
 | `sender`  | /messages | string | Filter by phone number (e.g. +1234567890) or display name |
 | `group`   | /messages | string | Filter by base64 group ID                                  |
-| `to`      | /send     | string | Recipient phone number (required)                          |
+| `to`      | /send     | string | Recipient: phone number, group ID, or Signal username (required) |
 | `message` | /send     | string | Message text (required)                                    |
 
 All parameters are optional for `/messages`. `to` and `message` are required for `/send`.
