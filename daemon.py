@@ -1,13 +1,21 @@
 import asyncio, json, sqlite3, subprocess, sys, os
+import html as html_lib
+import secrets
+import threading
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
-import threading
 
 DAEMON_DIR = os.path.expanduser("~/.signal_daemon")
 DB_PATH = os.path.join(DAEMON_DIR, "messages.db")
 SIGNAL_CLI = "signal-cli"
 PORT = 6000
+CONFIRM_PORT = 7000  # human-facing confirmation UI — keep this port away from untrusted software
+
+# In-memory store of pending outbound messages awaiting confirmation
+# { token: { account, to, message, created_at } }
+_pending: dict[str, dict] = {}
+_pending_lock = threading.Lock()
 
 # ── Database ──────────────────────────────────────────────────────────────────
 
@@ -116,7 +124,17 @@ def send_to_self(account, message):
         raise RuntimeError(result.stderr.strip())
     return True
 
-# ── HTTP Server ───────────────────────────────────────────────────────────────
+def send_to_number(account, number, message):
+    result = subprocess.run(
+        [SIGNAL_CLI, "-a", account, "send", "-m", message, number],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip())
+    return True
+
+# ── HTTP query ────────────────────────────────────────────────────────────────
 
 def query_messages(sender=None, group=None, since=None, until=None):
     db = sqlite3.connect(DB_PATH)
@@ -143,13 +161,15 @@ def query_messages(sender=None, group=None, since=None, until=None):
     db.close()
     return [dict(r) for r in rows]
 
+# ── Main API server (port 6000) ───────────────────────────────────────────────
+
 class Handler(BaseHTTPRequestHandler):
     def __init__(self, account, *args, **kwargs):
         self.account = account
         super().__init__(*args, **kwargs)
 
-    def log_message(self, format, *args):
-        print(f"[{datetime.now().isoformat()}] {args[0]} {args[1]} {args[2]}")
+    def log_message(self, fmt, *args):
+        print(f"[{datetime.now().isoformat()}] {' '.join(str(a) for a in args)}")
 
     def send_json(self, data, status=200):
         body = json.dumps(data, indent=2).encode()
@@ -182,26 +202,159 @@ class Handler(BaseHTTPRequestHandler):
             )
             self.send_json({"count": len(messages), "messages": messages})
 
-        elif parsed.path == "/send_to_self":
+        elif parsed.path == "/send":
             qs = parse_qs(parsed.query)
-            message = qs["message"][0] if "message" in qs else None
-            if not message:
-                self.send_json({"error": "missing 'message' query parameter"}, 400)
+            def first(key):
+                return qs[key][0] if key in qs else None
+
+            to = first("to")
+            message = first("message")
+            if not to or not message:
+                self.send_json({"error": "missing 'to' or 'message' query parameter"}, 400)
                 return
-            try:
-                send_to_self(self.account, message)
-                self.send_json({"ok": True, "message": message})
-            except RuntimeError as e:
-                self.send_json({"error": str(e)}, 500)
+
+            # Sending to self: send immediately
+            if to.strip() == self.account.strip():
+                try:
+                    send_to_self(self.account, message)
+                    self.send_json({"ok": True, "to": to, "message": message})
+                except RuntimeError as e:
+                    self.send_json({"error": str(e)}, 500)
+            else:
+                # Sending to someone else: require human confirmation
+                token = secrets.token_urlsafe(32)
+                with _pending_lock:
+                    _pending[token] = {
+                        "account": self.account,
+                        "to": to,
+                        "message": message,
+                        "created_at": datetime.utcnow().isoformat(),
+                    }
+                confirm_url = f"http://localhost:{CONFIRM_PORT}/confirm?token={token}"
+                print(f"[{datetime.now().isoformat()}] Confirmation required: {confirm_url}")
+                self.send_json({
+                    "pending": True,
+                    "confirm_url": confirm_url,
+                    "to": to,
+                    "message": message,
+                    "note": "Open confirm_url in your browser to approve or deny this message.",
+                })
 
         else:
             self.send_json({"error": "Not found"}, 404)
 
+
+# ── Confirmation server (port 7000, human-facing) ─────────────────────────────
+
+def _page(title: str, body_content: str) -> str:
+    e = html_lib.escape
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>{e(title)}</title>
+<style>
+  body {{ font-family: sans-serif; max-width: 640px; margin: 4em auto; padding: 0 1em; color: #111; }}
+  table {{ border-collapse: collapse; width: 100%; margin: 1.5em 0; }}
+  td {{ padding: 10px 12px; vertical-align: top; }}
+  tr:nth-child(even) {{ background: #f5f5f5; }}
+  .label {{ font-weight: bold; width: 80px; }}
+  .body-text {{ white-space: pre-wrap; font-family: monospace; font-size: 0.9em; }}
+  .actions {{ display: flex; gap: 1em; margin-top: 2em; }}
+  a.btn {{ padding: 12px 28px; text-decoration: none; border-radius: 6px; font-size: 1.05em; color: white; }}
+  a.send {{ background: #2563eb; }}
+  a.deny {{ background: #dc2626; }}
+  .meta {{ color: #888; font-size: 0.85em; margin-top: 2em; }}
+</style>
+</head><body>
+{body_content}
+</body></html>"""
+
+
+class ConfirmHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        print(f"[{datetime.now().isoformat()}] confirm: {' '.join(str(a) for a in args)}")
+
+    def send_html(self, content: str, status: int = 200) -> None:
+        data = content.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", len(data))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        token = qs.get("token", [None])[0]
+        e = html_lib.escape
+
+        if parsed.path == "/confirm":
+            if not token:
+                self.send_html(_page("Error", "<h2>Missing token</h2>"), 400)
+                return
+            with _pending_lock:
+                pending = _pending.get(token)
+            if not pending:
+                self.send_html(_page("Not found", "<h2>&#x274C; Not found</h2><p>This link is invalid or has already been used.</p>"), 404)
+                return
+            body_content = f"""
+<h2>&#x1F4F1; Confirm outbound Signal message</h2>
+<table>
+  <tr><td class="label">From</td><td>{e(pending['account'])}</td></tr>
+  <tr><td class="label">To</td><td>{e(pending['to'])}</td></tr>
+  <tr><td class="label">Message</td><td class="body-text">{e(pending['message'])}</td></tr>
+</table>
+<div class="actions">
+  <a class="btn send" href="/approve?token={e(token)}">&#x2714; Send</a>
+  <a class="btn deny" href="/deny?token={e(token)}">&#x2716; Don't send</a>
+</div>
+<p class="meta">Requested at {e(pending['created_at'])}</p>"""
+            self.send_html(_page("Confirm send", body_content))
+
+        elif parsed.path == "/approve":
+            if not token:
+                self.send_html(_page("Error", "<h2>Missing token</h2>"), 400)
+                return
+            with _pending_lock:
+                pending = _pending.pop(token, None)
+            if not pending:
+                self.send_html(_page("Already handled", "<h2>&#x274C; Already handled</h2><p>This link is invalid or has already been used.</p>"), 404)
+                return
+            try:
+                send_to_number(pending["account"], pending["to"], pending["message"])
+                print(f"[{datetime.now().isoformat()}] Confirmed and sent to {pending['to']}")
+                body_content = f"<h2>&#x2705; Message sent</h2><p>Sent to <strong>{e(pending['to'])}</strong>.</p>"
+                self.send_html(_page("Sent", body_content))
+            except Exception as ex:
+                body_content = f"<h2>&#x274C; Send failed</h2><pre>{e(str(ex))}</pre>"
+                self.send_html(_page("Error", body_content), 500)
+
+        elif parsed.path == "/deny":
+            if not token:
+                self.send_html(_page("Error", "<h2>Missing token</h2>"), 400)
+                return
+            with _pending_lock:
+                pending = _pending.pop(token, None)
+            if not pending:
+                self.send_html(_page("Already handled", "<h2>&#x274C; Already handled</h2><p>This link is invalid or has already been used.</p>"), 404)
+                return
+            print(f"[{datetime.now().isoformat()}] Denied send to {pending['to']}")
+            body_content = f"<h2>&#x1F6AB; Cancelled</h2><p>The message to <strong>{e(pending['to'])}</strong> was not sent.</p>"
+            self.send_html(_page("Cancelled", body_content))
+
+        else:
+            self.send_html(_page("Not found", "<h1>Not found</h1>"), 404)
+
+
 def run_server(account):
     def make_handler(*args, **kwargs):
-        Handler(account, *args, **kwargs)
-    print(f"HTTP server listening on http://localhost:{PORT}")
-    HTTPServer(("", PORT), make_handler).serve_forever()
+        return Handler(account, *args, **kwargs)
+    print(f"API server listening on http://localhost:{PORT}")
+    HTTPServer(("127.0.0.1", PORT), make_handler).serve_forever()
+
+
+def run_confirm_server() -> None:
+    print(f"Confirmation server listening on http://localhost:{CONFIRM_PORT} (human-facing)")
+    HTTPServer(("127.0.0.1", CONFIRM_PORT), ConfirmHandler).serve_forever()
+
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -212,7 +365,7 @@ if __name__ == "__main__":
     if not account:
         if len(sys.argv) < 2:
             print("Error: no account number stored. Please run:")
-            print("  python signal.py +1XXXXXXXXXX")
+            print("  python daemon.py +1XXXXXXXXXX")
             sys.exit(1)
         account = sys.argv[1]
         set_account(db, account)
@@ -222,4 +375,5 @@ if __name__ == "__main__":
     print(f"Using account: {account}")
 
     threading.Thread(target=run_server, args=(account,), daemon=True).start()
+    threading.Thread(target=run_confirm_server, daemon=True).start()
     asyncio.run(poll_loop(account))
