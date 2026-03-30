@@ -124,12 +124,13 @@ def send_to_self(account, message):
         raise RuntimeError(result.stderr.strip())
     return True
 
-def send_to_number(account, number, message):
-    result = subprocess.run(
-        [SIGNAL_CLI, "-a", account, "send", "-m", message, number],
-        capture_output=True,
-        text=True
-    )
+def send_to_number(account, recipient, message):
+    # Group IDs are base64 strings; phone numbers start with +
+    if recipient.startswith("+"):
+        cmd = [SIGNAL_CLI, "-a", account, "send", "-m", message, recipient]
+    else:
+        cmd = [SIGNAL_CLI, "-a", account, "send", "-m", message, "-g", recipient]
+    result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip())
     return True
